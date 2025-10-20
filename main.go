@@ -2,18 +2,21 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 
-	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/invopop/jsonschema"
+	orderedmap "github.com/wk8/go-ordered-map/v2"
 )
 
 func main() {
-	client := anthropic.NewClient()
+	client := NewOllamaClient("http://localhost:11434", "qwen3:8b")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	getUserMessage := func() (string, bool) {
@@ -25,14 +28,103 @@ func main() {
 
 	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition}
 
-	agent := NewAgent(&client, getUserMessage, tools)
+	agent := NewAgent(client, getUserMessage, tools)
 	err := agent.Run(context.TODO())
 	if err != nil {
 		fmt.Printf("Error: %s\n", err.Error())
 	}
 }
 
-func NewAgent(client *anthropic.Client, getUserMessage func() (string, bool), tools []ToolDefinition) *Agent {
+// OllamaClient wraps HTTP calls to Ollama
+type OllamaClient struct {
+	baseURL string
+	model   string
+	client  *http.Client
+}
+
+func NewOllamaClient(baseURL, model string) *OllamaClient {
+	return &OllamaClient{
+		baseURL: baseURL,
+		model:   model,
+		client:  &http.Client{},
+	}
+}
+
+// Ollama API structures
+type OllamaMessage struct {
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+}
+
+type ToolCall struct {
+	Function struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
+}
+
+type OllamaTool struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string                 `json:"name"`
+		Description string                 `json:"description"`
+		Parameters  map[string]interface{} `json:"parameters"`
+	} `json:"function"`
+}
+
+type OllamaRequest struct {
+	Model    string          `json:"model"`
+	Messages []OllamaMessage `json:"messages"`
+	Tools    []OllamaTool    `json:"tools,omitempty"`
+	Stream   bool            `json:"stream"`
+}
+
+type OllamaResponse struct {
+	Message OllamaMessage `json:"message"`
+	Done    bool          `json:"done"`
+}
+
+func (c *OllamaClient) Chat(ctx context.Context, messages []OllamaMessage, tools []OllamaTool) (*OllamaResponse, error) {
+	reqBody := OllamaRequest{
+		Model:    c.model,
+		Messages: messages,
+		Tools:    tools,
+		Stream:   false,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/chat", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var ollamaResp OllamaResponse
+	err = json.Unmarshal(body, &ollamaResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w, body: %s", err, string(body))
+	}
+
+	return &ollamaResp, nil
+}
+
+func NewAgent(client *OllamaClient, getUserMessage func() (string, bool), tools []ToolDefinition) *Agent {
 	return &Agent{
 		client:         client,
 		getUserMessage: getUserMessage,
@@ -41,15 +133,15 @@ func NewAgent(client *anthropic.Client, getUserMessage func() (string, bool), to
 }
 
 type Agent struct {
-	client         *anthropic.Client
+	client         *OllamaClient
 	getUserMessage func() (string, bool)
 	tools          []ToolDefinition
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	conversation := []anthropic.MessageParam{}
+	conversation := []OllamaMessage{}
 
-	fmt.Println("Chat with Claude (use 'ctrl-c' to quit)")
+	fmt.Println("Chat with Ollama (use 'ctrl-c' to quit)")
 
 	readUserInput := true
 	for {
@@ -60,38 +152,45 @@ func (a *Agent) Run(ctx context.Context) error {
 				break
 			}
 
-			userMessage := anthropic.NewUserMessage(anthropic.NewTextBlock(userInput))
-			conversation = append(conversation, userMessage)
+			conversation = append(conversation, OllamaMessage{
+				Role:    "user",
+				Content: userInput,
+			})
 		}
 
-		message, err := a.runInference(ctx, conversation)
+		response, err := a.runInference(ctx, conversation)
 		if err != nil {
 			return err
 		}
-		conversation = append(conversation, message.ToParam())
 
-		toolResults := []anthropic.ContentBlockParamUnion{}
-		for _, content := range message.Content {
-			switch content.Type {
-			case "text":
-				fmt.Printf("\u001b[93mClaude\u001b[0m: %s\n", content.Text)
-			case "tool_use":
-				result := a.executeTool(content.ID, content.Name, content.Input)
-				toolResults = append(toolResults, result)
+		conversation = append(conversation, response.Message)
+
+		// Check if there are tool calls
+		if len(response.Message.ToolCalls) > 0 {
+			readUserInput = false
+			toolResults := []string{}
+
+			for _, toolCall := range response.Message.ToolCalls {
+				result := a.executeTool(toolCall.Function.Name, toolCall.Function.Arguments)
+				toolResults = append(toolResults, fmt.Sprintf("Tool %s result: %s", toolCall.Function.Name, result))
 			}
-		}
-		if len(toolResults) == 0 {
+
+			// Add tool results as a user message
+			conversation = append(conversation, OllamaMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("Tool results: %v", toolResults),
+			})
+		} else {
+			// No tool calls, just print the response
+			fmt.Printf("\u001b[93mOllama\u001b[0m: %s\n", response.Message.Content)
 			readUserInput = true
-			continue
 		}
-		readUserInput = false
-		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
 	}
 
 	return nil
 }
 
-func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.ContentBlockParamUnion {
+func (a *Agent) executeTool(name string, input json.RawMessage) string {
 	var toolDef ToolDefinition
 	var found bool
 	for _, tool := range a.tools {
@@ -102,44 +201,58 @@ func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.Co
 		}
 	}
 	if !found {
-		return anthropic.NewToolResultBlock(id, "tool not found", true)
+		return "tool not found"
 	}
 
 	fmt.Printf("\u001b[92mtool\u001b[0m: %s(%s)\n", name, input)
 	response, err := toolDef.Function(input)
 	if err != nil {
-		return anthropic.NewToolResultBlock(id, err.Error(), true)
+		return err.Error()
 	}
-	return anthropic.NewToolResultBlock(id, response, false)
+	return response
 }
 
-func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
-	anthropicTools := []anthropic.ToolUnionParam{}
+func (a *Agent) runInference(ctx context.Context, conversation []OllamaMessage) (*OllamaResponse, error) {
+	ollamaTools := []OllamaTool{}
 
 	for _, tool := range a.tools {
-		anthropicTools = append(anthropicTools, anthropic.ToolUnionParam{
-			OfTool: &anthropic.ToolParam{
-				Name:        tool.Name,
-				Description: anthropic.String(tool.Description),
-				InputSchema: tool.InputSchema,
-			},
-		})
+		ollamaTool := OllamaTool{
+			Type: "function",
+		}
+		ollamaTool.Function.Name = tool.Name
+		ollamaTool.Function.Description = tool.Description
+
+		// Convert OrderedMap to regular map
+		properties := make(map[string]interface{})
+		if tool.InputSchema.Properties != nil {
+			for pair := tool.InputSchema.Properties.Oldest(); pair != nil; pair = pair.Next() {
+				properties[pair.Key] = pair.Value
+			}
+		}
+
+		// Convert the schema to Ollama format
+		params := map[string]interface{}{
+			"type":       "object",
+			"properties": properties,
+			"required":   []string{}, // Add required fields if needed
+		}
+		ollamaTool.Function.Parameters = params
+
+		ollamaTools = append(ollamaTools, ollamaTool)
 	}
 
-	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeHaiku4_5,
-		MaxTokens: int64(1024),
-		Messages:  conversation,
-		Tools:     anthropicTools,
-	})
-	return message, err
+	return a.client.Chat(ctx, conversation, ollamaTools)
 }
 
 type ToolDefinition struct {
-	Name        string                         `json:"name"`
-	Description string                         `json:"description"`
-	InputSchema anthropic.ToolInputSchemaParam `json:"input_schema"`
+	Name        string               `json:"name"`
+	Description string               `json:"description"`
+	InputSchema ToolInputSchemaParam `json:"input_schema"`
 	Function    func(input json.RawMessage) (string, error)
+}
+
+type ToolInputSchemaParam struct {
+	Properties *orderedmap.OrderedMap[string, *jsonschema.Schema]
 }
 
 var ReadFileDefinition = ToolDefinition{
@@ -169,7 +282,7 @@ func ReadFile(input json.RawMessage) (string, error) {
 	return string(content), nil
 }
 
-func GenerateSchema[T any]() anthropic.ToolInputSchemaParam {
+func GenerateSchema[T any]() ToolInputSchemaParam {
 	reflector := jsonschema.Reflector{
 		AllowAdditionalProperties: false,
 		DoNotReference:            true,
@@ -178,7 +291,7 @@ func GenerateSchema[T any]() anthropic.ToolInputSchemaParam {
 
 	schema := reflector.Reflect(v)
 
-	return anthropic.ToolInputSchemaParam{
+	return ToolInputSchemaParam{
 		Properties: schema.Properties,
 	}
 }

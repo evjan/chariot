@@ -1,4 +1,4 @@
-- [ ] Ollama
+- [x] Ollama
 - [ ] Task management
 - [ ] Skills
 - [ ] Memory
