@@ -1,0 +1,3 @@
+module chariot
+
+go 1.24.1
